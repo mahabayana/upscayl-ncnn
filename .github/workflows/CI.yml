@@ -104,6 +104,33 @@ jobs:
         "DUMPBIN_PATH=$dumpbin" | Add-Content $env:GITHUB_ENV
         "VS_INSTALLATION_PATH=$vsPath" | Add-Content $env:GITHUB_ENV
 
+        $vcomp = Get-ChildItem (Join-Path $vsPath 'VC\Redist\MSVC') -Filter vcomp140.dll -File -Recurse |
+          Where-Object {
+            $_.FullName -match '\\arm64\\Microsoft\.VC\d+\.OpenMP\\vcomp140\.dll$' -and
+            $_.FullName -notmatch '\\(?:onecore|debug_nonredist|spectre)\\'
+          } |
+          Sort-Object FullName -Descending |
+          Select-Object -First 1
+        if (-not $vcomp) {
+          throw 'No release ARM64 Visual C++ OpenMP runtime was found.'
+        }
+        $vcompHeaders = (& $dumpbin /headers $vcomp.FullName 2>&1 | Out-String)
+        if ($vcompHeaders -notmatch '(?im)\bAA64 machine \(ARM64\)' -or
+            $vcompHeaders -match '(?im)\b8664 machine \(x64\)') {
+          throw 'The selected Visual C++ OpenMP runtime is not ARM64 or contains x64 code.'
+        }
+        $vcompSignature = Get-AuthenticodeSignature $vcomp.FullName
+        if ($vcompSignature.Status -ne 'Valid' -or
+            $vcompSignature.SignerCertificate.Subject -notmatch '(?i)\bMicrosoft Corporation\b') {
+          throw 'The selected Visual C++ OpenMP runtime lacks a valid Microsoft signature.'
+        }
+        "OpenMP runtime: $($vcomp.FullName)" | Tee-Object -FilePath $report -Append
+        "OpenMP runtime version: $($vcomp.VersionInfo.FileVersion)" | Tee-Object -FilePath $report -Append
+        "OpenMP runtime SHA256: $((Get-FileHash $vcomp.FullName -Algorithm SHA256).Hash)" |
+          Tee-Object -FilePath $report -Append
+        $vcompHeaders | Tee-Object -FilePath $report -Append
+        "VCOMP140_PATH=$($vcomp.FullName)" | Add-Content $env:GITHUB_ENV
+
         $windowsSdkLib = Join-Path ${env:ProgramFiles(x86)} 'Windows Kits\10\Lib'
         $sdkVersions = Get-ChildItem $windowsSdkLib -Directory | Sort-Object Name -Descending
         $arm64Sdk = $sdkVersions | Where-Object {
@@ -230,9 +257,11 @@ jobs:
         }
         $exe = $executables[0]
         Copy-Item $exe.FullName 'artifacts\upscayl-bin.exe'
+        $vcompArtifact = Join-Path $PWD 'artifacts\vcomp140.dll'
+        Copy-Item $env:VCOMP140_PATH $vcompArtifact
 
         $localDlls = @(Get-ChildItem $exe.DirectoryName -Filter *.dll -File -Recurse)
-        $nativeFiles = @($exe) + $localDlls
+        $nativeFiles = @($exe, (Get-Item $vcompArtifact)) + $localDlls
         foreach ($file in $nativeFiles) {
           "`n===== $($file.FullName) =====" | Tee-Object -FilePath $report -Append
           $headers = (& $env:DUMPBIN_PATH /headers $file.FullName 2>&1 | Out-String)
@@ -258,6 +287,7 @@ jobs:
         retention-days: 14
         path: |
           artifacts\upscayl-bin.exe
+          artifacts\vcomp140.dll
           artifacts\configure.log
           artifacts\build.log
           artifacts\architecture-dependencies.txt
